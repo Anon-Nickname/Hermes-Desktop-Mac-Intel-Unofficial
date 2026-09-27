@@ -33,7 +33,7 @@ import { promisify } from 'node:util'
  * All GitHub API calls are unauthenticated (60 requests/hour per IP), so
  * release pages are fetched until exhausted (100 releases per page); other calls
  * are kept to one on stable and at most two on bleeding,
- * cached for ten minutes, and fall back to the last successful check when
+ * cached for thirty minutes per track even on manual clicks, and fall back to the last successful check when
  * the API is unavailable. A rate-limit 403 is reported to the dialog as
  * what it is, with the reset time.
  *
@@ -49,7 +49,7 @@ const releaseRepo = '__RELEASE_REPO__'
 const currentSha = '__CURRENT_SHA__'
 const defaultChannel: UpdateChannel = '__DEFAULT_CHANNEL__' as UpdateChannel
 
-const CHECK_CACHE_TTL_MS = 10 * 60 * 1000
+const CHECK_CACHE_TTL_MS = 30 * 60 * 1000
 
 const githubHeaders = { Accept: 'application/vnd.github+json', 'User-Agent': 'Hermes-Intel-Updater' }
 
@@ -214,14 +214,14 @@ async function releaseStatus(channel: UpdateChannel) {
 }
 
 async function readCheckCache(channel: UpdateChannel): Promise<any | null> {
-  const cached = await readJson('update-check-cache.json')
-  if (cached?.channel === channel && cached?.status?.fetchedAt) return cached
+  const cached = await readJson(`update-check-cache-${channel}.json`)
+  if (cached?.channel === channel && cached?.status?.currentSha === currentSha && cached?.status?.fetchedAt) return cached
   return null
 }
 
 async function writeCheckCache(channel: UpdateChannel, status: unknown): Promise<void> {
   try {
-    await writeJsonAtomic('update-check-cache.json', { channel, status })
+    await writeJsonAtomic(`update-check-cache-${channel}.json`, { channel, status })
   } catch {}
 }
 
@@ -237,11 +237,10 @@ export function installBleedingEdgeUpdater(): void {
     } catch {}
   }
 
-  ipcMain.handle('hermes:updates:check', async (_event, opts) => {
+  ipcMain.handle('hermes:updates:check', async () => {
     const channel = await readChannel()
-    const force = opts?.force === true
     const cached = await readCheckCache(channel)
-    if (!force && cached && Date.now() - cached.status.fetchedAt < CHECK_CACHE_TTL_MS) {
+    if (cached && Date.now() - cached.status.fetchedAt < CHECK_CACHE_TTL_MS) {
       return cached.status
     }
     try {
