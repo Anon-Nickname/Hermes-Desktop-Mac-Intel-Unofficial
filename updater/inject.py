@@ -4,7 +4,7 @@
 Reads pipeline/updater/update-override.ts, substitutes the build's release
 repository, upstream commit and baked default channel, writes it into the
 Electron main process sources and registers it from the actual bundler
-entrypoint: entry.ts on older tagged releases, main.ts on current upstream.
+entrypoint: entry.ts on tagged releases and recent main, main.ts on intermediate upstream.
 Fails closed if the bundler entry is unknown rather than shipping dead code.
 """
 import os
@@ -38,10 +38,14 @@ if not bundler.exists():
 bundler_text = bundler.read_text()
 main_entry = "entryPoints: [join(source, 'apps/desktop/electron/main.ts')]"
 legacy_entry = "const mainEntry = resolve(root, 'electron/entry.ts')"
-if main_entry in bundler_text and legacy_entry not in bundler_text:
-    via = 'main.ts'
-elif legacy_entry in bundler_text and main_entry not in bundler_text:
-    via = 'entry.ts'
+modern_entry = "entryPoints: [join(source, 'apps/desktop/electron/entry.ts')]"
+matched_entries = [
+    (marker, entry)
+    for marker, entry in ((main_entry, 'main.ts'), (legacy_entry, 'entry.ts'), (modern_entry, 'entry.ts'))
+    if bundler_text.count(marker) == 1
+]
+if len(matched_entries) == 1:
+    via = matched_entries[0][1]
 else:
     sys.exit('Unknown or ambiguous Electron main entrypoint; refuse inert override')
 entry = workspace / 'apps/desktop/electron' / via
@@ -70,3 +74,49 @@ else:
 entry.write_text(text)
 
 print(f"Injected updater override via {via} (release repo {replacements['__RELEASE_REPO__']}, default channel {replacements['__DEFAULT_CHANNEL__']})")
+
+# Recent upstream changed the About-version label to show the number of commits
+# since the last tag (e.g. 0.21.5+2128). Keep the full version in IPC/build
+# metadata but display only the release version in About and update views.
+# Older stable tags predate these components and remain untouched.
+label = workspace / 'apps/desktop/src/lib/version-label.ts'
+if label.exists():
+    for relative, anchor, replacement in (
+        ('apps/desktop/src/components/update-status.tsx',
+         'u.version(shortVersion(version.appVersion))',
+         "u.version(shortVersion(version.appVersion).replace(/\+\d+$/, ''))"),
+        ('apps/desktop/src/components/version-details.tsx',
+         '`v${shortVersion(version.appVersion)}`',
+         "`v${shortVersion(version.appVersion).replace(/\+\d+$/, '')}`"),
+    ):
+        file = workspace / relative
+        source = file.read_text()
+        if source.count(anchor) != 1:
+            sys.exit(f'{relative} version-label anchor missing or ambiguous ({source.count(anchor)}x)')
+        file.write_text(source.replace(anchor, replacement, 1))
+
+    # The statusbar also names the client build; backend labels retain their
+    # original version.
+    status = workspace / 'apps/desktop/src/lib/version-status.ts'
+    source = status.read_text()
+    anchor = 'shortVersion(rawVersion) : null'
+    if source.count(anchor) != 1:
+        sys.exit(f'version-status.ts anchor missing or ambiguous ({source.count(anchor)}x)')
+    status.write_text(source.replace(anchor, "(target === 'client' ? shortVersion(rawVersion).replace(/\\+\\d+$/, '') : shortVersion(rawVersion)) : null", 1))
+    test = workspace / 'apps/desktop/src/lib/version-status.test.ts'
+    assertions = test.read_text()
+    before = "expect(status.label).toBe('v0.4.2+1913')"
+    if assertions.count(before) != 1:
+        sys.exit(f'version-status.test.ts assertion missing or ambiguous ({assertions.count(before)}x)')
+    test.write_text(assertions.replace(before, "expect(status.label).toBe('v0.4.2')", 1))
+
+    # Keep backend update checks and progress events, but avoid automatic
+    # unauthenticated GitHub calls on boot/focus/daily timer. The client tab
+    # and Check now continue to invoke the override on demand.
+    store = workspace / 'apps/desktop/src/store/updates.ts'
+    source = store.read_text()
+    anchor = '  void checkUpdates()\n  void checkBackendUpdates()'
+    if source.count(anchor) != 1:
+        sys.exit(f'update poller anchor missing or ambiguous ({source.count(anchor)}x)')
+    store.write_text(source.replace(anchor, '  void checkBackendUpdates()', 1))
+    print('Cleaned client display version and disabled passive client GitHub checks')
